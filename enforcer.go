@@ -787,7 +787,15 @@ func (e *Enforcer) bumpPolicyVersion() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (bool, error) {
+	return e.enforceInSession(matcher, explains, nil, rvals...)
+}
+
+// enforceInSession is the shared enforcement core. A nil session reproduces the
+// exact historical behavior of enforce(); a bounded session threads the call's
+// budget and context through function closures, matcher compilation and the
+// policy loop without touching any shared enforcer cache.
+func (e *Enforcer) enforceInSession(matcher string, explains *[]string, session *enforceSession, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
 
 	defer func() {
@@ -804,19 +812,13 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		return true, nil
 	}
 
-	functions := e.fm.GetFunctions()
-	if _, ok := e.model["g"]; ok {
-		for key, ast := range e.model["g"] {
-			// g must be a normal role definition (ast.RM != nil)
-			//   or a conditional role definition (ast.CondRM != nil)
-			// ast.RM and ast.CondRM shouldn't be nil at the same time
-			if ast.RM != nil {
-				functions[key] = util.GenerateGFunction(ast.RM, e.gFunctionCache)
-			}
-			if ast.CondRM != nil {
-				functions[key] = util.GenerateConditionalGFunction(ast.CondRM)
-			}
-		}
+	var functions map[string]govaluate.ExpressionFunction
+	if session != nil && session.budget != nil {
+		// Bounded mode gets a fresh per-call function map whose closures capture
+		// only this call's budgetState. Nothing here is ever shared or cached.
+		functions = e.buildBoundedFunctions(session.budget)
+	} else {
+		functions = e.buildDefaultFunctions()
 	}
 
 	var (
@@ -884,12 +886,25 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 	hasEval := util.HasEval(expString)
 	if hasEval {
-		functions["eval"] = generateEvalFunction(functions, &parameters)
+		if session != nil && session.budget != nil {
+			functions["eval"] = generateBoundedEvalFunction(functions, &parameters, session.budget)
+		} else {
+			functions["eval"] = generateEvalFunction(functions, &parameters)
+		}
 	}
 	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
-	if err != nil {
-		return false, err
+	if session != nil && session.budget != nil {
+		// Independent bounded compile path: the expression captures this call's
+		// budget-aware closures and must never enter the shared matcherMap.
+		expression, err = govaluate.NewEvaluableExpressionWithFunctions(expString, functions)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
@@ -961,6 +976,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 			parameters.pVals = pvals
 
+			if session != nil && session.budget != nil {
+				if err = session.budget.chargePolicy(fmt.Sprintf("%s[%d]", pType, policyIndex)); err != nil {
+					return false, err
+				}
+			}
+
 			result, err := expression.Eval(parameters)
 			// log.LogPrint("Result: ", result)
 			if err != nil {
@@ -1002,6 +1023,14 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		matcherResults[0] = 1
 
 		parameters.pVals = make([]string, len(parameters.pTokens))
+
+		// No policy rules exist, so no policy unit is charged; still honor
+		// cancellation before the single matcher evaluation.
+		if session != nil && session.budget != nil {
+			if err = session.budget.checkContext(BudgetStagePolicy, "matcher"); err != nil {
+				return false, err
+			}
+		}
 
 		result, err := expression.Eval(parameters)
 		if err != nil {

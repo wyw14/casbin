@@ -18,11 +18,21 @@
 package defaultrolemanager
 
 import (
+	"context"
 	"errors"
 	"sync"
 
 	"github.com/casbin/casbin/v3/rbac"
 	"github.com/casbin/casbin/v3/util"
+)
+
+// Compile-time assertions that every default role manager supports the
+// budget-aware traversal protocol used by EnforceBounded.
+var (
+	_ rbac.BoundedRoleManager = (*RoleManagerImpl)(nil)
+	_ rbac.BoundedRoleManager = (*RoleManager)(nil)
+	_ rbac.BoundedRoleManager = (*ConditionalRoleManager)(nil)
+	_ rbac.BoundedRoleManager = (*ConditionalDomainManager)(nil)
 )
 
 const defaultDomain string = ""
@@ -363,6 +373,56 @@ func (rm *RoleManagerImpl) hasLinkHelper(targetName string, roles map[string]*Ro
 	}
 
 	return rm.hasLinkHelper(targetName, nextRoles, level-1)
+}
+
+// HasLinkBounded is the interruptible, node-reporting variant of HasLink.
+// onVisit is invoked once per distinct inspected node, starting with the
+// source node; cancellation and visitor errors abort the traversal.
+func (rm *RoleManagerImpl) HasLinkBounded(ctx context.Context, name1 string, name2 string, onVisit func(node string) error, domains ...string) (bool, error) {
+	if name1 == name2 || (rm.matchingFunc != nil && rm.Match(name1, name2)) {
+		return true, nil
+	}
+
+	// Lock to prevent race conditions between getRole and removeRole
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	user, userCreated := rm.getRole(name1)
+	role, roleCreated := rm.getRole(name2)
+
+	if userCreated {
+		defer rm.removeRole(user.name)
+	}
+	if roleCreated {
+		defer rm.removeRole(role.name)
+	}
+
+	return rm.hasLinkHelperBounded(ctx, role.name, map[string]*Role{user.name: user}, rm.maxHierarchyLevel, onVisit)
+}
+
+func (rm *RoleManagerImpl) hasLinkHelperBounded(ctx context.Context, targetName string, roles map[string]*Role, level int, onVisit func(node string) error) (bool, error) {
+	if level < 0 || len(roles) == 0 {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	nextRoles := map[string]*Role{}
+	for _, role := range roles {
+		if err := onVisit(role.name); err != nil {
+			return false, err
+		}
+		if targetName == role.name || (rm.matchingFunc != nil && rm.Match(role.name, targetName)) {
+			return true, nil
+		}
+		role.rangeRoles(func(key, value interface{}) bool {
+			nextRoles[key.(string)] = value.(*Role)
+			return true
+		})
+	}
+
+	return rm.hasLinkHelperBounded(ctx, targetName, nextRoles, level-1, onVisit)
 }
 
 // GetRoles gets the roles that a user inherits.
@@ -734,6 +794,16 @@ func (dm *DomainManager) HasLink(name1 string, name2 string, domains ...string) 
 	return rm.HasLink(name1, name2, domains...)
 }
 
+// HasLinkBounded delegates the interruptible traversal to the domain's role manager.
+func (dm *DomainManager) HasLinkBounded(ctx context.Context, name1 string, name2 string, onVisit func(node string) error, domains ...string) (bool, error) {
+	domain, err := dm.getDomain(domains...)
+	if err != nil {
+		return false, err
+	}
+	rm := dm.getRoleManager(domain, false)
+	return rm.HasLinkBounded(ctx, name1, name2, onVisit, domains...)
+}
+
 // GetRoles gets the roles that a subject inherits.
 func (dm *DomainManager) GetRoles(name string, domains ...string) ([]string, error) {
 	domain, err := dm.getDomain(domains...)
@@ -915,6 +985,56 @@ func (crm *ConditionalRoleManager) hasLinkHelper(targetName string, roles map[st
 	}
 
 	return crm.hasLinkHelper(targetName, nextRoles, level-1, domains...)
+}
+
+// HasLinkBounded is the interruptible, node-reporting variant of HasLink.
+// onVisit is invoked once per distinct inspected node, starting with the
+// source node; cancellation and visitor errors abort the traversal.
+func (crm *ConditionalRoleManager) HasLinkBounded(ctx context.Context, name1 string, name2 string, onVisit func(node string) error, domains ...string) (bool, error) {
+	if name1 == name2 || (crm.matchingFunc != nil && crm.Match(name1, name2)) {
+		return true, nil
+	}
+
+	// Lock to prevent race conditions between getRole and removeRole
+	crm.mutex.Lock()
+	defer crm.mutex.Unlock()
+
+	user, userCreated := crm.getRole(name1)
+	role, roleCreated := crm.getRole(name2)
+
+	if userCreated {
+		defer crm.removeRole(user.name)
+	}
+	if roleCreated {
+		defer crm.removeRole(role.name)
+	}
+
+	return crm.hasLinkHelperBounded(ctx, role.name, map[string]*Role{user.name: user}, crm.maxHierarchyLevel, onVisit, domains...)
+}
+
+func (crm *ConditionalRoleManager) hasLinkHelperBounded(ctx context.Context, targetName string, roles map[string]*Role, level int, onVisit func(node string) error, domains ...string) (bool, error) {
+	if level < 0 || len(roles) == 0 {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	nextRoles := map[string]*Role{}
+	for _, role := range roles {
+		if err := onVisit(role.name); err != nil {
+			return false, err
+		}
+		if targetName == role.name || (crm.matchingFunc != nil && crm.Match(role.name, targetName)) {
+			return true, nil
+		}
+		role.rangeRoles(func(key, value interface{}) bool {
+			nextRole := value.(*Role)
+			return crm.getNextRoles(role, nextRole, domains, nextRoles)
+		})
+	}
+
+	return crm.hasLinkHelperBounded(ctx, targetName, nextRoles, level-1, onVisit, domains...)
 }
 
 func (crm *ConditionalRoleManager) getNextRoles(currentRole, nextRole *Role, domains []string, nextRoles map[string]*Role) bool {
@@ -1255,6 +1375,18 @@ func (cdm *ConditionalDomainManager) HasLink(name1 string, name2 string, domains
 	}
 	rm := cdm.getConditionalRoleManager(domain, false)
 	return rm.HasLink(name1, name2, domains...)
+}
+
+// HasLinkBounded is required because ConditionalDomainManager embeds both
+// ConditionalRoleManager and DomainManager; it delegates to the conditional
+// role manager of the requested domain.
+func (cdm *ConditionalDomainManager) HasLinkBounded(ctx context.Context, name1 string, name2 string, onVisit func(node string) error, domains ...string) (bool, error) {
+	domain, err := cdm.getDomain(domains...)
+	if err != nil {
+		return false, err
+	}
+	rm := cdm.getConditionalRoleManager(domain, false)
+	return rm.HasLinkBounded(ctx, name1, name2, onVisit, domains...)
 }
 
 func (cdm *ConditionalDomainManager) GetRoles(name string, domains ...string) ([]string, error) {
