@@ -125,9 +125,15 @@ func (e *Enforcer) RemovePolicyIndex(ptype string) {
 	e.policyIndexes.Delete(ptype)
 }
 
-func (e *Enforcer) getPolicyIndex(ptype string) *policyIndex {
+// resettableIndex is implemented by every index stored under policyIndexes,
+// including the built-in ipMatch CIDR candidate index.
+type resettableIndex interface {
+	reset()
+}
+
+func (e *Enforcer) getPolicyIndex(ptype string) interface{} {
 	if value, ok := e.policyIndexes.Load(ptype); ok {
-		return value.(*policyIndex)
+		return value
 	}
 	return nil
 }
@@ -206,4 +212,16 @@ func policyMatchesBucket(bucketIDs []uint32, policyIndex int, bucket uint32) boo
 	}
 	id := bucketIDs[policyIndex]
 	return id == wildcardPolicyBucket || id == bucket
+}
+
+// ruleIsCandidate reports whether the rule at policyIndex must be evaluated
+// for the current request. Exactly one of the two index modes is active:
+// string buckets for a user PolicyIndex, or the ipMatch CIDR candidate mask.
+// A false answer only skips the matcher evaluation; the effector still merges
+// the rule as a non-match, exactly as in the full scan.
+func ruleIsCandidate(bucketIDs []uint32, bucket uint32, ipCandidates []bool, policyIndex int) bool {
+	if bucketIDs != nil {
+		return policyMatchesBucket(bucketIDs, policyIndex, bucket)
+	}
+	return ipCandidates[policyIndex]
 }

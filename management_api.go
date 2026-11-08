@@ -484,6 +484,10 @@ func (e *Enforcer) RemoveFilteredNamedGroupingPolicy(ptype string, fieldIndex in
 // AddFunction adds a customized function.
 func (e *Enforcer) AddFunction(name string, function govaluate.ExpressionFunction) {
 	e.fm.AddFunction(name, function)
+	// Function replacement may change the semantics a built-in index was
+	// proven against (e.g. a same-name ipMatch), so invalidate that
+	// generation and let the next Enforce re-analyze or fall back.
+	e.bumpFunctionVersion()
 }
 
 func (e *Enforcer) SelfAddPolicy(sec string, ptype string, rule []string) (bool, error) {

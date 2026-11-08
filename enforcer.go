@@ -41,7 +41,8 @@ import (
 
 // Enforcer is the main interface for authorization enforcement and policy management.
 type Enforcer struct {
-	policyVersion uint64
+	policyVersion   uint64
+	functionVersion uint64
 
 	modelPath string
 	model     model.Model
@@ -233,6 +234,9 @@ func (e *Enforcer) LoadModel() error {
 	e.fm = model.LoadFunctionMap()
 
 	e.initialize()
+	// The reload installs fresh assertions and a fresh function map; drop all
+	// index generations and deny caches so no stale snapshot is reused.
+	e.resetPolicyCaches()
 
 	return nil
 }
@@ -724,7 +728,7 @@ func (e *Enforcer) invalidateMatcherMap() {
 
 func (e *Enforcer) resetPolicyCaches() {
 	e.policyIndexes.Range(func(_, value interface{}) bool {
-		value.(*policyIndex).reset()
+		value.(resettableIndex).reset()
 		return true
 	})
 	e.denyCache.Range(func(key, _ interface{}) bool {
@@ -784,6 +788,14 @@ func (e *Enforcer) getPolicyVersion() uint64 {
 
 func (e *Enforcer) bumpPolicyVersion() {
 	atomic.AddUint64(&e.policyVersion, 1)
+}
+
+func (e *Enforcer) getFunctionVersion() uint64 {
+	return atomic.LoadUint64(&e.functionVersion)
+}
+
+func (e *Enforcer) bumpFunctionVersion() {
+	atomic.AddUint64(&e.functionVersion, 1)
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
@@ -904,12 +916,26 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	matcherUsesPolicy := strings.Contains(expString, pType+"_")
 	effectExpr := e.effectiveEffectExpr(pType, pTokens, e.model["e"][eType].Value, policyLen, matcherUsesPolicy)
 
-	var bucketIDs []uint32
-	var requestBucket uint32
-	var usePolicyIndex bool
+	var (
+		bucketIDs      []uint32
+		requestBucket  uint32
+		ipCandidates   []bool
+		usePolicyIndex bool
+	)
 	if pIndex := e.getPolicyIndex(pType); pIndex != nil {
-		bucketIDs = pIndex.ensureBuilt(e.model["p"][pType])
-		requestBucket, usePolicyIndex = pIndex.requestBucket(rvals)
+		switch idx := pIndex.(type) {
+		case *policyIndex:
+			bucketIDs = idx.ensureBuilt(e.model["p"][pType])
+			requestBucket, usePolicyIndex = idx.requestBucket(rvals)
+		case *ipMatchPolicyIndex:
+			// The built-in index was proven against the default matcher "m"
+			// and request type "r". A runtime custom matcher or a different
+			// EnforceContext may change the predicate, so those calls evaluate
+			// the full candidate set.
+			if matcher == "" && rType == "r" && mType == "m" {
+				ipCandidates, usePolicyIndex = idx.candidates(e, e.model["p"][pType], rvals)
+			}
+		}
 	}
 
 	var policyEffects []effector.Effect
@@ -948,7 +974,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 			// set to no-match at first
 			matcherResults[policyIndex] = 0
-			if usePolicyIndex && !policyMatchesBucket(bucketIDs, policyIndex, requestBucket) {
+			if usePolicyIndex && !ruleIsCandidate(bucketIDs, requestBucket, ipCandidates, policyIndex) {
 				effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
 				if err != nil {
 					return false, err
