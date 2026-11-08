@@ -17,7 +17,14 @@
 
 package persist
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrInvalidPolicyOperation is returned when a policy operation fails
+// structural validation.
+var ErrInvalidPolicyOperation = errors.New("invalid policy operation")
 
 // TransactionalAdapter defines the interface for adapters that support transactions.
 // Adapters implementing this interface can participate in Casbin transactions.
@@ -59,3 +66,26 @@ const (
 	// OperationUpdate represents updating policy rules.
 	OperationUpdate
 )
+
+// Validate checks the structural invariants of a buffered policy operation.
+func (op PolicyOperation) Validate() error {
+	if op.Section != "p" && op.Section != "g" {
+		return ErrInvalidPolicyOperation
+	}
+	if op.PolicyType == "" {
+		return ErrInvalidPolicyOperation
+	}
+	switch op.Type {
+	case OperationAdd, OperationRemove:
+		if len(op.Rules) == 0 {
+			return ErrInvalidPolicyOperation
+		}
+	case OperationUpdate:
+		if len(op.Rules) == 0 || len(op.Rules) != len(op.OldRules) {
+			return ErrInvalidPolicyOperation
+		}
+	default:
+		return ErrInvalidPolicyOperation
+	}
+	return nil
+}
