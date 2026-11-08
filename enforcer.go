@@ -29,6 +29,7 @@ import (
 	"github.com/casbin/casbin/v3/detector"
 	"github.com/casbin/casbin/v3/effector"
 	"github.com/casbin/casbin/v3/log"
+	"github.com/casbin/casbin/v3/matcher"
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
 	fileadapter "github.com/casbin/casbin/v3/persist/file-adapter"
@@ -58,6 +59,9 @@ type Enforcer struct {
 	denyCache     sync.Map
 	logger        log.Logger
 	detectors     []detector.Detector
+
+	// matcherBackend is nil when the default govaluate matcher backend is active.
+	matcherBackend matcher.Backend
 
 	enabled              bool
 	autoSave             bool
@@ -882,14 +886,27 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		pTokens: pTokens,
 	}
 
-	hasEval := util.HasEval(expString)
-	if hasEval {
-		functions["eval"] = generateEvalFunction(functions, &parameters)
-	}
-	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
-	if err != nil {
-		return false, err
+	var expression compiledMatcherExpr
+	hasEval := false
+	if e.matcherBackend != nil {
+		// Explicit matcher backend (e.g. CEL): static declarations, build-time
+		// type checking and the backend's own compilation cache. The bool
+		// result is still merged by the existing effector below.
+		expression, err = e.compileBackendMatcher(rType, pType, mType, matcher)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		hasEval = util.HasEval(expString)
+		if hasEval {
+			functions["eval"] = generateEvalFunction(functions, &parameters)
+		}
+		var govExpression *govaluate.EvaluableExpression
+		govExpression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
+		if err != nil {
+			return false, err
+		}
+		expression = govaluateMatcherExpr{expression: govExpression}
 	}
 
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
@@ -961,23 +978,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 			parameters.pVals = pvals
 
-			result, err := expression.Eval(parameters)
-			// log.LogPrint("Result: ", result)
-			if err != nil {
-				return false, err
+			matched, evalErr := expression.Eval(parameters)
+			if evalErr != nil {
+				return false, evalErr
 			}
-
-			switch result := result.(type) {
-			case bool:
-				if result {
-					matcherResults[policyIndex] = 1
-				}
-			case float64:
-				if result != 0 {
-					matcherResults[policyIndex] = 1
-				}
-			default:
-				return false, errors.New("matcher result should be bool, int or float")
+			if matched {
+				matcherResults[policyIndex] = 1
 			}
 
 			// if e.model["e"]["e"].Value == "priority(p_eft) || deny" {
@@ -1003,12 +1009,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 		parameters.pVals = make([]string, len(parameters.pTokens))
 
-		result, err := expression.Eval(parameters)
+		matched, err := expression.Eval(parameters)
 		if err != nil {
 			return false, err
 		}
 
-		if result.(bool) {
+		if matched {
 			policyEffects[0] = effector.Allow
 		} else {
 			policyEffects[0] = effector.Indeterminate

@@ -30,6 +30,7 @@ import (
 type Assertion struct {
 	Key             string
 	Value           string
+	RawValue        string
 	Tokens          []string
 	ParamsTokens    []string
 	Policy          [][]string
@@ -190,6 +191,7 @@ func (ast *Assertion) copy() *Assertion {
 	newAst := &Assertion{
 		Key:           ast.Key,
 		Value:         ast.Value,
+		RawValue:      ast.RawValue,
 		PolicyMap:     policyMap,
 		PolicyVersion: ast.PolicyVersion,
 		Tokens:        tokens,

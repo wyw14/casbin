@@ -98,6 +98,12 @@ func (model Model) AddDef(sec string, key string, value string) bool {
 	}
 
 	if sec == "m" {
+		// RawValue keeps the matcher dialect as authored: r./p. prefixes are
+		// escaped to valid identifiers, but govaluate-specific normalizations
+		// (backslash doubling, [ ] -> ( ) tuple rewriting) are not applied.
+		// Explicit non-govaluate backends such as CEL compile this text.
+		ast.RawValue = ast.Value
+
 		// Escape backslashes in string literals to match CSV parsing behavior
 		ast.Value = util.EscapeStringLiterals(ast.Value)
 
